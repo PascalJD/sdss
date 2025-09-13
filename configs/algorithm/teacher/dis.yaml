@@ -1,0 +1,3 @@
+name: dis 
+ckpt_uri: "/home/pascal/projects/single-step-diffusion-samplers/logs/run/runs/algorithm-dis_seed-0_target-gaussian_mixture_2025-08-06_09-26-40/checkpoints"    
+step: null   

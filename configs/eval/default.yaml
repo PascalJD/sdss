@@ -1,0 +1,5 @@
+use_best_ckpt: true  # load latest by default
+max_ckpts: 1  # evaluate only the most‑recent checkpoint
+batch_size: 2000
+n_repeat: 20
+save_raw: true   

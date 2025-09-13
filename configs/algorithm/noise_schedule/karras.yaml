@@ -1,0 +1,6 @@
+_target_: algorithms.common.diffusion_related.noise_schedule.get_karras_sigma_schedule
+total_steps: ${algorithm.num_steps}
+T: 20.0
+eps: 0.002
+rho: 7.0
+reverse: true

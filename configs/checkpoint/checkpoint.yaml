@@ -1,0 +1,11 @@
+# configs/checkpoint/checkpoint.yaml
+save_every: 1000
+max_to_keep: 1  # Always keep the 4 most recent
+async_save: true
+restore: true  # not implemented
+
+best:
+  enable: true
+  metric: "KL/elbo_mov_avg"
+  mode: "max"
+  top_n: 1

@@ -1,0 +1,25 @@
+name: sdss
+step_size: ${target.dis.step_size}
+batch_size: ${target.all.batch_size}
+iters: 40000
+loss: "is"  # Only option now
+grad_clip: 1.
+eval_ode: True
+
+defaults:
+  - model: pisgrad_net
+
+model:
+  bias_init: 1.0
+  weight_init: 1e-8
+
+init_std:  ${target.dis.initial_scale}
+num_steps: 128
+eval_num_steps: 128
+
+sigma_max: ${algorithm.init_std}
+sigma_min: 0.002
+rho: 7.0
+
+debug:
+  traj_batch: 64

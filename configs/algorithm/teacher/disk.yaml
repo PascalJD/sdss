@@ -1,0 +1,8 @@
+name: disk 
+ckpt_uri: "/home/pascal/projects/single-step-diffusion-samplers/logs/run/runs/algorithm-disk_target-gaussian_mixture_seed-42_2025-08-12_16-06-31/checkpoints/39999"    
+step: null   
+
+karras:
+  sigma_max: 7.5   # T in EDM paper
+  sigma_min: 0.002  # eps in CM/EDM
+  rho: 7.0
