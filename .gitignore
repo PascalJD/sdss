@@ -1,5 +1,6 @@
 logs/
 sweeps/
+targets/data/
 sweep.py
 
 # Byte-compiled / optimized / DLL files
