@@ -14,7 +14,6 @@ schedule_type: "linear"
 beta_min: 0.01
 beta_max: ${algorithm.max_diffusion}
 
-
 model:
   bias_init: 1.0
   weight_init: 1e-8

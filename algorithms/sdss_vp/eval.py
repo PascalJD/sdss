@@ -45,15 +45,12 @@ def plot_paths(full_paths, *, max_paths=64, wandb_key="figures/paths"):
 
 def get_multi_eval_fn(
     rnd_base_ode,
-    rnd_base_sde, 
+    rnd_base_sde,
     target,
     target_samples,
     cfg,
     eval_budgets,
     viz_budget,
-    *,
-    alt_weight_fn=None,
-    alt_tag: str = "ou",
 ):
     # JIT one reverse per budget; ensure we get paths back
     rnd_rev_ode = {
@@ -103,7 +100,7 @@ def get_multi_eval_fn(
                 sub, model_state, model_state.params
             )
 
-            # Discrepancies per budget
+            # Discrepancies per budget (on ODE samples)
             for d in cfg.discrepancies:
                 key = f"discrepancies/{d}"
                 val = getattr(discrepancies, f"compute_{d}")(
@@ -115,27 +112,24 @@ def get_multi_eval_fn(
 
             # Optional path plots for viz_budget
             if k == viz_budget:
-                logger.update(
-                    plot_paths(paths_ode, wandb_key="figures/paths")
-                )
+                logger.update(plot_paths(paths_ode, wandb_key="figures/paths"))
                 _append(logger, "other/target_log_prob",
                         jnp.mean(target.log_prob(samples_ode)))
                 samples_for_plot = samples_ode
 
-            # SDE pass: weights (EM + OU-corrected)
+            # SDE pass: compute EM and OU weights directly from rnd()
             rng, sub = jax.random.split(rng)
-            (_, run_c, stoch_c, term_c, paths_em) = rnd_rev_sde[k](
+            # rnd_base_sde was created with return_ou_weight=True
+            (_, run_c_em, run_c_ou, stoch_c, term_c, _paths_sde) = rnd_rev_sde[k](
                 sub, model_state, model_state.params
             )
 
-            # EM weights and metrics
-            log_w_em = -(run_c + stoch_c + term_c)  # stoch is zero 
-            ln_z_em = jax.scipy.special.logsumexp(log_w_em) \
-                - jnp.log(cfg.eval_samples)
-            elbo_em = jnp.mean(log_w_em)  # = -mean(run_c+term_c) in our convention 
+            # EM metrics
+            log_w_em = -(run_c_em + stoch_c + term_c)
+            ln_z_em = jax.scipy.special.logsumexp(log_w_em) - jnp.log(cfg.eval_samples)
+            elbo_em = jnp.mean(log_w_em)
             ess_em = compute_reverse_ess(log_w_em, cfg.eval_samples)
 
-            # Store EM metrics (suffixed for all k)
             _append(logger, _suffix("logZ/reverse", k), ln_z_em)
             _append(logger, _suffix("KL/elbo", k), elbo_em)
             _append(logger, _suffix("ESS/reverse", k), ess_em)
@@ -146,28 +140,20 @@ def get_multi_eval_fn(
                 _append(logger, "KL/elbo", elbo_em)
                 _append(logger, "ESS/reverse", ess_em)
 
-            # Alternate weights (e.g., OU backward on the SDE path)
-            if alt_weight_fn is not None:
-                log_w_alt = alt_weight_fn(
-                    model_state, model_state.params, paths_em, log_w_em
-                )
-                ln_z_alt = jax.scipy.special.logsumexp(log_w_alt)\
-                    - jnp.log(cfg.eval_samples)
-                elbo_alt = jnp.mean(log_w_alt)
-                ess_alt = compute_reverse_ess(log_w_alt, cfg.eval_samples)
+            # OU metrics (computed independently, no correction)
+            log_w_ou = -(run_c_ou + stoch_c + term_c)
+            ln_z_ou = jax.scipy.special.logsumexp(log_w_ou) - jnp.log(cfg.eval_samples)
+            elbo_ou = jnp.mean(log_w_ou)
+            ess_ou = compute_reverse_ess(log_w_ou, cfg.eval_samples)
 
-                _append(
-                    logger, _suffix(f"logZ/reverse_{alt_tag}", k), ln_z_alt
-                )
-                _append(logger, _suffix(f"KL/elbo_{alt_tag}", k), elbo_alt)
-                _append(logger, _suffix(f"ESS/reverse_{alt_tag}", k), ess_alt)
+            _append(logger, _suffix("logZ/reverse_ou", k), ln_z_ou)
+            _append(logger, _suffix("KL/elbo_ou", k), elbo_ou)
+            _append(logger, _suffix("ESS/reverse_ou", k), ess_ou)
 
         # Visuals and extras for viz_budget
         if samples_for_plot is not None:
             logger.update(
-                target.visualise(
-                    samples=samples_for_plot, show=cfg.visualize_samples
-                )
+                target.visualise(samples=samples_for_plot, show=cfg.visualize_samples)
             )
         if cfg.compute_emc and cfg.target.has_entropy:
             _append(logger, "other/EMC", target.entropy(samples_for_plot))
@@ -187,7 +173,7 @@ def get_multi_eval_fn(
 
 
 def run_eval_sdss_vp(cfg, target, model_state):
-    """Evaluate at multiple budgets; add OU-backward metrics for all k; save CSVs."""
+    """Evaluate at multiple budgets; compute EM and OU weights directly from rnd(); save CSVs."""
     rng = jax.random.PRNGKey(cfg.seed)
 
     dim = target.dim
@@ -216,7 +202,7 @@ def run_eval_sdss_vp(cfg, target, model_state):
                 f"num_steps={alg_cfg.num_steps} not divisible by k={k}"
             )
 
-    # Two RND bases: ODE for samples; SDE for weights
+    # Two RND bases: ODE for samples; SDE for weights (EM+OU) from scratch
     rnd_base_ode = partial(
         rnd,
         batch_size=cfg.eval_samples,
@@ -227,7 +213,14 @@ def run_eval_sdss_vp(cfg, target, model_state):
         stop_grad=True,
         use_ode=True,
         return_traj=True,
+        # return_ou_weight left False (default) to avoid extra work here
     )
+
+    # schedule metadata for OU shrink:
+    schedule_type = getattr(alg_cfg, "schedule_type", "linear")
+    bmin = getattr(alg_cfg, "beta_min", None)
+    bmax = getattr(alg_cfg, "beta_max", None)
+
     rnd_base_sde = partial(
         rnd,
         batch_size=cfg.eval_samples,
@@ -238,19 +231,9 @@ def run_eval_sdss_vp(cfg, target, model_state):
         stop_grad=True,
         use_ode=False,
         return_traj=True,
-    )
-
-    schedule_type = getattr(alg_cfg, "schedule_type", "linear")
-    bmin = bmax = None
-    if schedule_type.lower() == "linear":
-        bmin = alg_cfg.noise_schedule.sigma_min
-        bmax = alg_cfg.noise_schedule.sigma_max
-
-    ou_weight_fn = make_ou_weight_fn(
-        prior_std=alg_cfg.init_std,
-        noise_schedule=alg_cfg.noise_schedule,
+        # ask rnd to compute OU weights alongside EM
+        return_ou_weight=True,
         schedule_type=schedule_type,
-        num_steps=alg_cfg.num_steps,
         beta_min=bmin,
         beta_max=bmax,
         n_trapz=1025,
@@ -264,8 +247,6 @@ def run_eval_sdss_vp(cfg, target, model_state):
         cfg=cfg,
         eval_budgets=eval_budgets,
         viz_budget=viz_budget,
-        alt_weight_fn=ou_weight_fn,
-        alt_tag="ou",
     )
 
     # Repeat loop (logger accumulates across calls)
@@ -301,11 +282,11 @@ def run_eval_sdss_vp(cfg, target, model_state):
     def _to_np(x):  # DeviceArray -> float
         return float(np.asarray(x))
 
-    # EM & OU metrics
     for k in eval_budgets:
         em_lnz = logger.get(f"logZ/reverse@k={k}", [])
         em_elbo = logger.get(f"KL/elbo@k={k}", [])
         em_ess = logger.get(f"ESS/reverse@k={k}", [])
+
         ou_lnz = logger.get(f"logZ/reverse_ou@k={k}", [])
         ou_elbo = logger.get(f"KL/elbo_ou@k={k}", [])
         ou_ess = logger.get(f"ESS/reverse_ou@k={k}", [])

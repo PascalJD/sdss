@@ -25,7 +25,7 @@ def vp_linear_shrink(
 ) -> jnp.ndarray:
     """s_{t0|t1} for linear beta(t) on [0,1]."""
     d_beta = beta_max - beta_min
-    integ = beta_min * (t1 - t0) + 0.5 * d_beta * (t1 * t1 - t0 * t0)
+    integ = 0.5 * beta_min * (t1 - t0) + 0.25 * d_beta * (t1 * t1 - t0 * t0)
     return jnp.exp(-integ)
 
 
@@ -76,7 +76,7 @@ def vp_shrink_from_schedule(
     n_trapz: int = 4097
 ) -> jnp.ndarray:
     integ = _integrate_beta_trapz(beta_fn, total_steps, t0, t1, n_trapz)
-    return jnp.exp(-integ)
+    return jnp.exp(-0.5 * integ)
 
 
 def vp_var_from_schedule(
@@ -131,7 +131,7 @@ def make_ou_weight_fn(
             noise_schedule, num_steps, t0, t1, n_trapz
         )
 
-    def alt_weight_fn(model_state, params, paths, log_w_em):
+    def weight_fn(model_state, params, paths, log_w_em):
         B, Kp1, D = paths.shape
         k = Kp1 - 1
         if (num_steps % k) != 0:
@@ -151,8 +151,8 @@ def make_ou_weight_fn(
 
         # EM backward kernel
         beta_t = jax.vmap(lambda c: noise_schedule(c))(codes_f32)  # (k,)
-        var_em = (2.0 * beta_t * (prior_std ** 2)) * dt  # (k,)
-        mean_em = Xnp1 - (beta_t * dt)[None, :, None] * Xnp1  # (B,k,D)
+        var_em = beta_t * (prior_std ** 2) * dt  # (k,)
+        mean_em = Xnp1 - 0.5 * (beta_t * dt)[None, :, None] * Xnp1  # (B,k,D)
         log_bwd_em = _gaussian_log_prob_diag(Xn, mean_em, var_em[None, :])  # (B,k)
 
         # OU backward params per step
@@ -166,4 +166,4 @@ def make_ou_weight_fn(
         log_w_ou = log_w_em + delta
         return log_w_ou 
 
-    return alt_weight_fn
+    return weight_fn

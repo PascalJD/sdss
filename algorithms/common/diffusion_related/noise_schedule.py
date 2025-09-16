@@ -5,11 +5,13 @@ def get_linear_noise_schedule(total_steps, sigma_min=0.01, sigma_max=10., revers
     if reverse:
         def linear_noise_schedule(step):
             t = step / total_steps
-            return 0.5 * ((1 - t) * sigma_min + t * sigma_max)
+            return (1 - t) * sigma_min + t * sigma_max
+            # return 0.5 * ((1 - t) * sigma_min + t * sigma_max)
     else:
         def linear_noise_schedule(step):
             t = (total_steps - step) / total_steps
-            return 0.5 * ((1 - t) * sigma_min + t * sigma_max)
+            return (1 - t) * sigma_min + t * sigma_max
+            # return 0.5 * ((1 - t) * sigma_min + t * sigma_max)
     return linear_noise_schedule
 
 
