@@ -4,7 +4,11 @@ from functools import partial
 import numpyro.distributions as npdist
 
 from algorithms.sdss_vp.vp_ou import vp_linear_shrink, vp_shrink_from_schedule
-
+from algorithms.sdss_vp.integrators import (
+    compute_step_params, control_time, sigma_for_lgv, scale as integ_scale,
+    fwd_mean as integ_fwd_mean, bwd_mean as integ_bwd_mean,
+    ode_drift
+)
 
 def sample_kernel(rng, mean, scale):
     eps = jax.random.normal(rng, shape=(mean.shape[0],))
@@ -16,8 +20,9 @@ def log_prob_kernel(x, mean, scale):
     return dist.log_prob(x)
 
 
-def _make_step_codes(total_steps: int,
-                     eval_steps: int | None) -> jnp.ndarray:
+def _make_step_codes(
+        total_steps: int, eval_steps: int | None
+    ) -> jnp.ndarray:
     t = int(total_steps)
     if eval_steps is None:
         k = t
@@ -44,11 +49,11 @@ def per_sample_rnd(
     prior_to_target=True,
     use_ode=True,
     *,
-    return_ou_weight: bool = False,
     schedule_type: str = "linear",
     beta_min: float | None = None,
     beta_max: float | None = None,
     n_trapz: int = 1025,
+    integrator_kind: str = "em", 
 ):
     prior_std, prior_sample, prior_logp = prior_tuple
     target_logp = target.log_prob
@@ -59,14 +64,6 @@ def per_sample_rnd(
     d = t_float / float(k)
     dt = d / t_float
 
-    if schedule_type.lower() == "linear" and (beta_min is not None) and (beta_max is not None):
-        def compute_s(t0_norm, t1_norm):
-            return vp_linear_shrink(t0_norm, t1_norm, float(beta_min), float(beta_max))
-    else:
-        def compute_s(t0_norm, t1_norm):
-            s_sq = vp_shrink_from_schedule(noise_schedule, num_steps, t0_norm, t1_norm, n_trapz)
-            return jnp.sqrt(s_sq)
-
     def lgv_init(x, t_code, sigma_t, t_total):
         tr = t_code / t_total
         return sigma_t * (
@@ -76,153 +73,132 @@ def per_sample_rnd(
     lgv_init = partial(lgv_init, t_total=t_float)
 
     def sim_prior_to_target(state, t_code):
-        if return_ou_weight:
-            x, log_w_em, log_w_ou, rng_inner = state
-        else:
-            x, log_w_em, rng_inner = state
-
-        t_code = t_code.astype(jnp.float32)
-
+        x, log_w_em, rng_inner = state
         if stop_grad:
             x = jax.lax.stop_gradient(x)
 
-        beta_t = noise_schedule(t_code)
-        sigma_t = jnp.sqrt(beta_t) * prior_std
-        t1_norm = t_code / t_float
-        t0_norm = t1_norm - dt
-
-        # control
-        lgv = jax.lax.stop_gradient(
-            jax.grad(lgv_init)(x, t_code, sigma_t)
+        # per-step parameters
+        t_code = t_code.astype(jnp.float32)
+        sp = compute_step_params(
+            kind=integrator_kind,
+            t1_code=t_code, 
+            dt=dt, 
+            prior_std=prior_std,
+            noise_schedule=noise_schedule, 
+            num_steps=num_steps,
+            schedule_type=schedule_type, 
+            beta_min=beta_min,
+            beta_max=beta_max, 
+            n_trapz=n_trapz
         )
+
+        # control at integrator-defined time 
+        lgv_sigma = sigma_for_lgv(integrator_kind, sp)
+        lgv = jax.lax.stop_gradient(jax.grad(lgv_init)(x, t_code, lgv_sigma))
+        t_ctrl = control_time(integrator_kind, sp)
         u = model_state.apply_fn(
-            params,
+            params, 
             x,
-            (t_code / t_float) * jnp.ones(1),
+            t_ctrl * jnp.ones(1),
             (d / t_float) * jnp.ones(1),
-            lgv,
+            lgv
         )
 
-        # Forward EM kernel (always EM forward)
-        fwd_mean = x + (sigma_t * u + 0.5 * beta_t * x) * dt
-        scale = sigma_t * jnp.sqrt(dt)
+        # forward kernel
+        fwd_m = integ_fwd_mean(integrator_kind, x, u, sp)
+        sc = integ_scale(integrator_kind, sp)
 
-        rng_inner, sub = jax.random.split(rng_inner)
         if use_ode:
-            x_new = x + (0.5 * sigma_t * u + 0.5 * beta_t * x) * dt
+            # PF ODE shortcuts for sampling
+            x_new = ode_drift(integrator_kind, x, u, sp)
         else:
-            x_new = sample_kernel(sub, fwd_mean, scale)
-
+            rng_inner, sub = jax.random.split(rng_inner)
+            x_new = sample_kernel(sub, fwd_m, sc)
         if stop_grad:
             x_new = jax.lax.stop_gradient(x_new)
 
-        # Backward EM kernel
-        bwd_em_mean = x_new - 0.5 * beta_t * x_new * dt
-        fwd_lp = log_prob_kernel(x_new, fwd_mean, scale)
-        bwd_em_lp = log_prob_kernel(x, bwd_em_mean, scale)
+        # backward kernel (matched)
+        bwd_m = integ_bwd_mean(integrator_kind, x_new, sp)
+
+        # log-likelihoods
+        fwd_lp = log_prob_kernel(x_new, fwd_m, sc)
+        bwd_em_lp = log_prob_kernel(x, bwd_m, sc)
         log_w_em = log_w_em + (bwd_em_lp - fwd_lp)
 
-        if return_ou_weight:
-            # Backward OU kernel (exact noising)
-            s = compute_s(t0_norm, t1_norm)
-            scale_ou = jnp.sqrt(jnp.maximum(1.0 - s * s, 1e-20)) * prior_std
-            bwd_ou_mean = s * x_new
-            bwd_ou_lp = log_prob_kernel(x, bwd_ou_mean, scale_ou)
-            log_w_ou = log_w_ou + (bwd_ou_lp - fwd_lp)
-            return (x_new, log_w_em, log_w_ou, rng_inner), x_new
-        else:
-            return (x_new, log_w_em, rng_inner), x_new
+        return (x_new, log_w_em, rng_inner), x_new
 
     def sim_target_to_prior(state, t_code):
-        if return_ou_weight:
-            x, log_w_em, log_w_ou, rng_inner = state
-        else:
-            x, log_w_em, rng_inner = state
-
+        x, log_w_em, rng_inner = state
         t_code = t_code.astype(jnp.float32)
 
-        beta_t = noise_schedule(t_code)
-        sigma_t = jnp.sqrt(beta_t) * prior_std
-        scale = sigma_t * jnp.sqrt(dt)
+        # per-step parameters
+        sp = compute_step_params(
+            kind=integrator_kind,
+            t1_code=t_code, 
+            dt=dt, 
+            prior_std=prior_std,
+            noise_schedule=noise_schedule, 
+            num_steps=num_steps,
+            schedule_type=schedule_type, 
+            beta_min=beta_min,
+            beta_max=beta_max, 
+            n_trapz=n_trapz
+        )
+        sc = integ_scale(integrator_kind, sp)
 
-        t1_norm = t_code / t_float
-        t0_norm = t1_norm - dt
-
-        # Backward EM step (sample)
-        bwd_mean = x - 0.5 * beta_t * x * dt
+        # sample from backward kernel (denominator path)
+        bwd_m = integ_bwd_mean(integrator_kind, x, sp)
         rng_inner, sub = jax.random.split(rng_inner)
-        x_new = sample_kernel(sub, bwd_mean, scale)
+        x_new = sample_kernel(sub, bwd_m, sc)
 
         if stop_grad:
             x_new = jax.lax.stop_gradient(x_new)
 
-        # control at right endpoint
-        lgv = jax.lax.stop_gradient(jax.grad(lgv_init)(x_new, t_code, sigma_t))
+        # control at right endpoint state, but integrator-defined time
+        lgv_sigma = sigma_for_lgv(integrator_kind, sp)
+        lgv = jax.lax.stop_gradient(jax.grad(lgv_init)(x_new, t_code, lgv_sigma))
+        t_ctrl = control_time(integrator_kind, sp)
         u = model_state.apply_fn(
-            params,
+            params, 
             x_new,
-            (t_code / t_float) * jnp.ones(1),
+            t_ctrl * jnp.ones(1),
             (d / t_float) * jnp.ones(1),
-            lgv,
+            lgv
         )
 
-        # Forward EM kernel
-        fwd_mean = x_new + (sigma_t * u + 0.5 * beta_t * x) * dt
-        fwd_lp = log_prob_kernel(x, fwd_mean, scale)
-        bwd_lp = log_prob_kernel(x_new, bwd_mean, scale)
+        # forward kernel scored at right endpoint state
+        fwd_m = integ_fwd_mean(integrator_kind, x_new, u, sp)
+
+        fwd_lp = log_prob_kernel(x, fwd_m, sc)
+        bwd_lp = log_prob_kernel(x_new, bwd_m, sc)
         log_w_em = log_w_em + (bwd_lp - fwd_lp)
 
-        if return_ou_weight:
-            # Replace backward by OU kernel (exact)
-            s = compute_s(t0_norm, t1_norm)
-            scale_ou = jnp.sqrt(jnp.maximum(1.0 - s * s, 1e-20)) * prior_std
-            bwd_ou_mean = s * x
-            bwd_ou_lp = log_prob_kernel(x_new, bwd_ou_mean, scale_ou)
-            log_w_ou = log_w_ou + (bwd_ou_lp - fwd_lp)
-            return (x_new, log_w_em, log_w_ou, rng_inner), x_new
-        else:
-            return (x_new, log_w_em, rng_inner), x_new
+        return (x_new, log_w_em, rng_inner), x_new
 
     rng, sub = jax.random.split(rng)
 
     if prior_to_target:
         codes_desc = step_codes[::-1]
         x0 = jnp.clip(prior_sample(seed=sub), -4 * prior_std, 4 * prior_std)
-        if return_ou_weight:
-            state0 = (x0, 0.0, 0.0, rng)
-            (xT, log_ratio_em, log_ratio_ou, _), xs = jax.lax.scan(
-                sim_prior_to_target, state0, codes_desc
-            )
-        else:
-            state0 = (x0, 0.0, rng)
-            (xT, log_ratio_em, _), xs = jax.lax.scan(
-                sim_prior_to_target, state0, codes_desc
-            )
+        state0 = (x0, 0.0, rng)
+        (xT, log_ratio_em, _), xs = jax.lax.scan(
+            sim_prior_to_target, state0, codes_desc
+        )
         term_c = prior_logp(x0) - target_logp(xT)
     else:
         codes_asc = step_codes
         x0 = target.sample(sub, ())
-        if return_ou_weight:
-            state0 = (x0, 0.0, 0.0, rng)
-            (xT, log_ratio_em, log_ratio_ou, _), xs = jax.lax.scan(
-                sim_target_to_prior, state0, codes_asc
-            )
-        else:
-            state0 = (x0, 0.0, rng)
-            (xT, log_ratio_em, _), xs = jax.lax.scan(
-                sim_target_to_prior, state0, codes_asc
-            )
+        state0 = (x0, 0.0, rng)
+        (xT, log_ratio_em, _), xs = jax.lax.scan(
+            sim_target_to_prior, state0, codes_asc
+        )
         term_c = prior_logp(xT) - target_logp(x0)
 
     traj = jnp.concatenate([x0[None, ...], xs], axis=0)
     stoch_c = jnp.zeros_like(log_ratio_em)
     run_c_em = -log_ratio_em
 
-    if return_ou_weight:
-        run_c_ou = -log_ratio_ou
-        return xT, run_c_em, run_c_ou, stoch_c, term_c, traj
-    else:
-        return xT, run_c_em, stoch_c, term_c, traj
+    return xT, run_c_em, stoch_c, term_c, traj
 
 
 def rnd(
@@ -240,41 +216,36 @@ def rnd(
     use_ode=False,
     return_traj=False,
     *,
-    return_ou_weight: bool = False,
     schedule_type: str = "linear",
     beta_min: float | None = None,
     beta_max: float | None = None,
     n_trapz: int = 1025,
+    integrator_kind: str = "em", 
 ):
     rngs = jax.random.split(rng, num=batch_size)
-    if return_ou_weight:
-        xT, rc_em, rc_ou, sc, tc, traj = jax.vmap(
-            per_sample_rnd,
-            in_axes=(0, None, None, None, None, None, None,
-                     None, None, None, None, None,
-                     None, None, None, None),  # all trailing kwargs shared
-        )(
-            rngs, model_state, params, prior_tuple, target,
-            num_steps, noise_schedule, eval_steps, stop_grad,
-            prior_to_target, use_ode,
-            True, schedule_type, beta_min, beta_max, n_trapz
+    def _one(r):
+        return per_sample_rnd(
+            r, 
+            model_state, 
+            params, 
+            prior_tuple, 
+            target,
+            num_steps, 
+            noise_schedule,
+            eval_steps,
+            stop_grad,
+            prior_to_target,
+            use_ode,
+            schedule_type=schedule_type,
+            beta_min=beta_min,
+            beta_max=beta_max,
+            n_trapz=n_trapz,
+            integrator_kind=integrator_kind,
         )
-        if return_traj:
-            return xT, rc_em, rc_ou, sc, tc, traj
-        return xT, rc_em, rc_ou, sc, tc
-    else:
-        xT, rc, sc, tc, traj = jax.vmap(
-            per_sample_rnd,
-            in_axes=(0, None, None, None, None, None, None,
-                     None, None, None, None),  # original signature
-        )(
-            rngs, model_state, params, prior_tuple, target,
-            num_steps, noise_schedule, eval_steps, stop_grad,
-            prior_to_target, use_ode,
-        )
-        if return_traj:
-            return xT, rc, sc, tc, traj
-        return xT, rc, sc, tc
+    xT, rc_em, sc, tc, traj = jax.vmap(_one)(rngs)
+    if return_traj:
+        return xT, rc_em, sc, tc, traj
+    return xT, rc_em, sc, tc
 
 
 def neg_elbo(

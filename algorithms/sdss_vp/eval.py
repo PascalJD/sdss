@@ -2,8 +2,10 @@
 from __future__ import annotations
 from functools import partial
 from pathlib import Path
+from typing import Any
 import time
 import csv
+import json
 
 import numpy as np
 import jax
@@ -16,7 +18,7 @@ from algorithms.common.eval_methods.utils import (
     moving_averages, save_samples, compute_reverse_ess
 )
 from algorithms.sdss_vp.fb_rnd import rnd
-from algorithms.sdss_vp.vp_ou import make_ou_weight_fn
+# from algorithms.sdss_vp.vp_ou import make_ou_weight_fn
 from algorithms.common.ipm_eval import discrepancies
 
 
@@ -117,14 +119,13 @@ def get_multi_eval_fn(
                         jnp.mean(target.log_prob(samples_ode)))
                 samples_for_plot = samples_ode
 
-            # SDE pass: compute EM and OU weights directly from rnd()
+            # SDE pass: compute integrator pass 
             rng, sub = jax.random.split(rng)
-            # rnd_base_sde was created with return_ou_weight=True
-            (_, run_c_em, run_c_ou, stoch_c, term_c, _paths_sde) = rnd_rev_sde[k](
+            (_, run_c_em, stoch_c, term_c, _paths_sde) = rnd_rev_sde[k](
                 sub, model_state, model_state.params
             )
 
-            # EM metrics
+            # metrics
             log_w_em = -(run_c_em + stoch_c + term_c)
             ln_z_em = jax.scipy.special.logsumexp(log_w_em) - jnp.log(cfg.eval_samples)
             elbo_em = jnp.mean(log_w_em)
@@ -140,15 +141,9 @@ def get_multi_eval_fn(
                 _append(logger, "KL/elbo", elbo_em)
                 _append(logger, "ESS/reverse", ess_em)
 
-            # OU metrics (computed independently, no correction)
-            log_w_ou = -(run_c_ou + stoch_c + term_c)
-            ln_z_ou = jax.scipy.special.logsumexp(log_w_ou) - jnp.log(cfg.eval_samples)
-            elbo_ou = jnp.mean(log_w_ou)
-            ess_ou = compute_reverse_ess(log_w_ou, cfg.eval_samples)
-
-            _append(logger, _suffix("logZ/reverse_ou", k), ln_z_ou)
-            _append(logger, _suffix("KL/elbo_ou", k), elbo_ou)
-            _append(logger, _suffix("ESS/reverse_ou", k), ess_ou)
+            if target.log_Z is not None:
+                if k == viz_budget:
+                    _append(logger, "logZ/delta_reverse", jnp.abs(ln_z_em - target.log_Z))
 
         # Visuals and extras for viz_budget
         if samples_for_plot is not None:
@@ -172,193 +167,164 @@ def get_multi_eval_fn(
     return eval_once, logger
 
 
-def run_eval_sdss_vp(cfg, target, model_state):
-    """Evaluate at multiple budgets; compute EM and OU weights directly from rnd(); save CSVs."""
-    rng = jax.random.PRNGKey(cfg.seed)
+def _is_scalar_metric(x: Any) -> bool:
+    """Return True if x is a scalar we can safely put in CSV."""
+    # Skip wandb images/objects
+    if isinstance(x, getattr(wandb, "Image", ())):
+        return False
+    # Plain scalars
+    if isinstance(x, (int, float, bool, str)):
+        return True
+    # NumPy / JAX scalars
+    if isinstance(x, np.generic):
+        return True
+    if isinstance(x, (np.ndarray, jnp.ndarray)):
+        return np.asarray(x).shape == ()
+    return False
 
-    dim = target.dim
-    alg_cfg = cfg.algorithm
-    eval_cfg = cfg.eval
-    out_root = Path("/home/pascal/projects/single-step-diffusion-samplers/logs/eval/runs")
-    out_root.mkdir(parents=True, exist_ok=True)
 
-    # Prior
-    prior = distrax.MultivariateNormalDiag(
-        jnp.zeros(dim), jnp.ones(dim) * alg_cfg.init_std
-    )
-    prior_tuple = (alg_cfg.init_std, prior.sample, prior.log_prob)
+def _to_python(x: Any) -> Any:
+    """Convert JAX/NumPy types to vanilla Python; arrays -> lists (for JSON)."""
+    if isinstance(x, (np.ndarray, jnp.ndarray)):
+        arr = np.asarray(x)
+        return arr.item() if arr.shape == () else arr.tolist()
+    if isinstance(x, np.generic):
+        return x.item()
+    return x
 
-    # Target samples for discrepancies
-    target_samples = target.sample(jax.random.PRNGKey(0), (cfg.eval_samples,))
 
-    # Eval budgets
-    eval_budgets = list(
-        getattr(alg_cfg, "multi_eval_steps", [1, 2, 4, 8, 16, 32, 64, 128])
-    )
-    viz_budget = getattr(alg_cfg, "viz_eval_steps", max(eval_budgets))
-    for k in eval_budgets:
-        if alg_cfg.num_steps % k != 0:
-            raise ValueError(
-                f"num_steps={alg_cfg.num_steps} not divisible by k={k}"
-            )
+def _last_scalar_row(logger: dict[str, list]) -> dict[str, Any]:
+    """Pick the last scalar value for each metric key (for CSV append)."""
+    row = {}
+    for k, v in logger.items():
+        if not isinstance(v, list) or len(v) == 0:
+            continue
+        last = v[-1]
+        # Skip non-serializable artifacts (e.g., wandb.Image) or non-scalars
+        if _is_scalar_metric(last):
+            row[k] = _to_python(last)
+    return row
 
-    # Two RND bases: ODE for samples; SDE for weights (EM+OU) from scratch
-    rnd_base_ode = partial(
-        rnd,
-        batch_size=cfg.eval_samples,
-        prior_tuple=prior_tuple,
-        target=target,
-        num_steps=alg_cfg.num_steps,
-        noise_schedule=alg_cfg.noise_schedule,
-        stop_grad=True,
-        use_ode=True,
-        return_traj=True,
-        # return_ou_weight left False (default) to avoid extra work here
-    )
 
-    # schedule metadata for OU shrink:
-    schedule_type = getattr(alg_cfg, "schedule_type", "linear")
-    bmin = getattr(alg_cfg, "beta_min", None)
-    bmax = getattr(alg_cfg, "beta_max", None)
+def _full_history_rows(logger: dict[str, list], *, scalars_only: bool = True) -> tuple[list[str], list[dict[str, Any]]]:
+    """
+    Build full history as rows. If scalars_only=True, keep only scalar-valued metrics
+    (good for CSV). If False, convert arrays to lists (good for JSON).
+    """
+    # Determine number of evaluation rows from max list length
+    lengths = [len(v) for v in logger.values() if isinstance(v, list)]
+    n = max(lengths) if lengths else 0
 
-    rnd_base_sde = partial(
-        rnd,
-        batch_size=cfg.eval_samples,
-        prior_tuple=prior_tuple,
-        target=target,
-        num_steps=alg_cfg.num_steps,
-        noise_schedule=alg_cfg.noise_schedule,
-        stop_grad=True,
-        use_ode=False,
-        return_traj=True,
-        # ask rnd to compute OU weights alongside EM
-        return_ou_weight=True,
-        schedule_type=schedule_type,
-        beta_min=bmin,
-        beta_max=bmax,
-        n_trapz=1025,
-    )
+    # Establish the set of keys to include
+    keys: list[str] = []
+    for k, v in logger.items():
+        if not isinstance(v, list):
+            continue
+        if scalars_only:
+            # Keep if the last recorded value is scalar; this is a heuristic
+            if len(v) > 0 and _is_scalar_metric(v[-1]):
+                keys.append(k)
+        else:
+            keys.append(k)
 
-    eval_fn, logger = get_multi_eval_fn(
-        rnd_base_ode=rnd_base_ode,
-        rnd_base_sde=rnd_base_sde,
-        target=target,
-        target_samples=target_samples,
-        cfg=cfg,
-        eval_budgets=eval_budgets,
-        viz_budget=viz_budget,
-    )
+    # Build rows
+    rows: list[dict[str, Any]] = []
+    for i in range(n):
+        r: dict[str, Any] = {}
+        for k in keys:
+            seq = logger.get(k, [])
+            val = seq[i] if i < len(seq) else None
+            if scalars_only:
+                r[k] = _to_python(val) if _is_scalar_metric(val) else None
+            else:
+                # JSON path: allow lists; convert arrays to lists
+                r[k] = _to_python(val)
+        rows.append(r)
 
-    # Repeat loop (logger accumulates across calls)
-    n_repeat = int(eval_cfg.n_repeat)
-    t0 = time.time()
-    for rep in range(n_repeat):
-        rng, sub = jax.random.split(rng)
-        _ = eval_fn(model_state, sub)  # appends to `logger`
+    return keys, rows
 
-        # Optional lightweight W&B snapshot each rep (viz budget only)
-        if cfg.use_wandb and logger.get("logZ/reverse"):
-            wb_payload = {
-                "eval/rep": rep,
-                "eval/logZ_em": float(logger["logZ/reverse"][-1]),
-                "eval/ELBO_em": float(logger["KL/elbo"][-1]),
-                "eval/ESS_em": float(logger["ESS/reverse"][-1]),
-            }
-            if "figures/paths" in logger and logger["figures/paths"]:
-                wb_payload["figures/paths"] = logger["figures/paths"][-1]
-            for d in cfg.discrepancies:
-                if logger.get(f"discrepancies/{d}"):
-                    wb_payload[f"discrepancies/{d}"] = float(logger[f"discrepancies/{d}"][-1])
-            wandb.log(wb_payload)
 
-    # Save CSVs
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    tag = f"{alg_cfg.name}_{cfg.target.name}_seed{cfg.seed}"
-    raw_path = out_root / f"{tag}_raw_{ts}.csv"
-    agg_path = out_root / f"{tag}_agg_{ts}.csv"
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
 
-    # RAW dump: per k, per metric, per rep.
-    raw_rows = []
-    def _to_np(x):  # DeviceArray -> float
-        return float(np.asarray(x))
 
-    for k in eval_budgets:
-        em_lnz = logger.get(f"logZ/reverse@k={k}", [])
-        em_elbo = logger.get(f"KL/elbo@k={k}", [])
-        em_ess = logger.get(f"ESS/reverse@k={k}", [])
+def save_metrics(
+    logger: dict[str, list],
+    cfg,
+    *,
+    fmt: str = "csv",  # "csv" or "json"
+    mode: str = "append",  # "append" or "overwrite" (CSV); JSON always overwrites
+    filename: str | None = None,  # default: metrics.csv / metrics.json
+) -> str:
+    # Resolve directory from Hydra config and ensure it exists
+    metrics_dir = Path(getattr(cfg.paths, "metrics_dir"))
+    metrics_dir.mkdir(parents=True, exist_ok=True)
 
-        ou_lnz = logger.get(f"logZ/reverse_ou@k={k}", [])
-        ou_elbo = logger.get(f"KL/elbo_ou@k={k}", [])
-        ou_ess = logger.get(f"ESS/reverse_ou@k={k}", [])
+    # Pick filename
+    if filename is None:
+        filename = "metrics.csv" if fmt.lower() == "csv" else "metrics.json"
+    path = metrics_dir / filename
 
-        # Rows per rep for EM
-        for i in range(len(em_lnz)):
-            raw_rows.append({
-                "k": k, "kind": "weights_em",
-                "rep": i,
-                "logZ": _to_np(em_lnz[i]),
-                "ELBO": _to_np(em_elbo[i]),
-                "ESS": _to_np(em_ess[i]),
-            })
-        # Rows per rep for OU
-        for i in range(len(ou_lnz)):
-            raw_rows.append({
-                "k": k, "kind": "weights_ou",
-                "rep": i,
-                "logZ": _to_np(ou_lnz[i]),
-                "ELBO": _to_np(ou_elbo[i]),
-                "ESS": _to_np(ou_ess[i]),
-            })
-        # Discrepancies on ODE samples
-        for d in cfg.discrepancies:
-            disc_key = f"discrepancies/{d}@k={k}"
-            disc_vals = logger.get(disc_key, [])
-            for i in range(len(disc_vals)):
-                raw_rows.append({
-                    "k": k, "kind": "samples_ode",
-                    "rep": i,
-                    f"disc/{d}": _to_np(disc_vals[i]),
-                })
+    fmt = fmt.lower()
+    mode = mode.lower()
 
-    # Save RAW
-    raw_cols = sorted({c for r in raw_rows for c in r.keys()})
-    with raw_path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=raw_cols)
-        w.writeheader()
-        for r in raw_rows:
-            w.writerow(r)
+    if fmt == "json":
+        # Save the entire (sanitized) history as a single JSON file
+        sanitized: dict[str, list] = {}
+        for k, v in logger.items():
+            if isinstance(v, list):
+                sv = []
+                for item in v:
+                    if isinstance(item, getattr(wandb, "Image", ())):
+                        sv.append(None)  # drop images
+                    else:
+                        sv.append(_to_python(item))
+                sanitized[k] = sv
+        _atomic_write_text(path, json.dumps(sanitized, indent=2))
+        return str(path)
 
-    # Save AGG (mean/std per (kind,k))
-    agg_rows = []
-    from collections import defaultdict
-    bucket = defaultdict(list)
-    for r in raw_rows:
-        bucket[(r["kind"], r["k"])].append(r)
-    for (kind, k), rows in sorted(bucket.items(), key=lambda z: (z[0][1], z[0][0])):
-        out = {"kind": kind, "k": k, "count": len(rows)}
-        # Numerics present
-        num_keys = set()
-        for r in rows:
-            for kk in r:
-                if kk in ("logZ", "ELBO", "ESS") or kk.startswith("disc/"):
-                    num_keys.add(kk)
-        for kk in sorted(num_keys):
-            vals = np.array([r[kk] for r in rows if kk in r], dtype=float)
-            out[f"{kk}_mean"] = float(vals.mean()) if vals.size else np.nan
-            out[f"{kk}_std"] = float(vals.std(ddof=1)) if vals.size > 1 else 0.0
-        agg_rows.append(out)
+    if fmt != "csv":
+        raise ValueError("fmt must be 'csv' or 'json'")
 
-    agg_cols = sorted({c for r in agg_rows for c in r.keys()})
-    with agg_path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=agg_cols)
-        w.writeheader()
-        for r in agg_rows:
-            w.writerow(r)
+    if mode == "overwrite":
+        # Rebuild whole scalar history and rewrite CSV
+        header, rows = _full_history_rows(logger, scalars_only=True)
+        header = sorted(header)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=header)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({k: r.get(k, None) for k in header})
+        tmp.replace(path)
+        return str(path)
 
-    elapsed = time.time() - t0
-    if cfg.use_wandb:
-        wandb.log({"eval/runtime_sec": elapsed})
+    if mode != "append":
+        raise ValueError("mode must be 'append' or 'overwrite' for CSV")
 
-    print(f"[eval] Wrote RAW rows to: {raw_path}")
-    print(f"[eval] Wrote aggregated stats to: {agg_path}")
-    return {"raw_csv": str(raw_path), "agg_csv": str(agg_path)}
+    # Append one last-row snapshot of scalar metrics
+    row = _last_scalar_row(logger)
+
+    # If file doesn't exist, write header + first row
+    if not path.exists():
+        with path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            writer.writeheader()
+            writer.writerow(row)
+        return str(path)
+
+    # If header changed (new keys), rebuild entire file to keep one consistent CSV
+    with path.open("r", newline="") as f:
+        reader = csv.reader(f)
+        existing_header = next(reader, None)
+    if existing_header is None or set(existing_header) != set(row.keys()):
+        # Rewrite whole file from history to keep a single consistent file
+        return save_metrics(logger, cfg, fmt="csv", mode="overwrite", filename=filename)
+
+    # Normal append
+    with path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        writer.writerow(row)
+    return str(path)

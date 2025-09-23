@@ -10,7 +10,7 @@ hydra:
 
 
 wandb:
-  project: single_step_diffusion_samplers
+  project: sdss
   entity: pascal_jutras_dube
   dir: ${paths.output}
   resume: allow

@@ -25,8 +25,8 @@ def vp_linear_shrink(
 ) -> jnp.ndarray:
     """s_{t0|t1} for linear beta(t) on [0,1]."""
     d_beta = beta_max - beta_min
-    integ = 0.5 * beta_min * (t1 - t0) + 0.25 * d_beta * (t1 * t1 - t0 * t0)
-    return jnp.exp(-integ)
+    integ = beta_min * (t1 - t0) + 0.5 * d_beta * (t1 * t1 - t0 * t0)
+    return jnp.exp(-0.5 * integ)
 
 
 def vp_linear_var(
@@ -34,7 +34,7 @@ def vp_linear_var(
 ) -> jnp.ndarray:
     """(1 - s^2) * sigma0^2."""
     s = vp_linear_shrink(t0, t1, beta_min, beta_max)
-    return (1.0 - s * s) * (sigma0 ** 2)
+    return jnp.maximum(1.0 - s * s, 1e-20) * (sigma0 ** 2)
 
 
 def vp_ou_backward_logprob_linear(
@@ -83,7 +83,7 @@ def vp_var_from_schedule(
     beta_fn, total_steps: int, sigma0: float, t0: float, t1: float
 ) -> jnp.ndarray:
     s = vp_shrink_from_schedule(beta_fn, total_steps, t0, t1)
-    return (1.0 - s * s) * (sigma0 ** 2)
+    return jnp.maximum(1.0 - s * s, 1e-20) * (sigma0 ** 2)
 
 
 def vp_ou_backward_logprob_from_schedule(
@@ -97,8 +97,8 @@ def vp_ou_backward_logprob_from_schedule(
     n_trapz: int = 4097
 ) -> jnp.ndarray:
     integ = _integrate_beta_trapz(beta_fn, total_steps, t0, t1, n_trapz)
-    s = jnp.exp(-integ)
-    var = (1.0 - s * s) * (sigma0 ** 2)
+    s = jnp.exp(-0.5 * integ)
+    var = jnp.maximum(1.0 - s * s, 1e-20) * (sigma0 ** 2)
     mean = s * x1
     return _gaussian_log_prob_diag(x0, mean, var)
 

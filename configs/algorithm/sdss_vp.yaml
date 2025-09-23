@@ -1,7 +1,7 @@
 name: sdss_vp
 step_size: ${target.dis.step_size}
 batch_size: ${target.all.batch_size}
-iters: 40000
+iters: 50000
 loss: is
 grad_clip: 1.0
 max_diffusion: 10.0
@@ -22,7 +22,10 @@ sd_warmup: 5000
 sd_wmax: 0.25
 ema_decay: 0.999
 
+integrator_train: "em" 
+integrator_eval: "midpoint_em"
+
 init_std: ${target.dis.initial_scale}
 num_steps: 128
-multi_eval_steps: [1,2,64,128]
-viz_eval_steps: 128  
+multi_eval_steps: [1,2,4,128]
+viz_eval_steps: 2

@@ -75,7 +75,7 @@ def _per_sample_mse(
         x, rng_local = state
 
         beta_t = betas(t_code)
-        sigma_t = jnp.sqrt(2.0 * beta_t) * prior_std
+        sigma_t = jnp.sqrt(beta_t) * prior_std
 
         lgv = jax.lax.stop_gradient(
             jax.grad(lgv_init)(x, t_code, sigma_t)
@@ -87,7 +87,7 @@ def _per_sample_mse(
         u = model_state.apply_fn(
             params_local, x, t_norm, d_norm, lgv
         )
-        x_new = x + (0.5 * sigma_t * u + beta_t * x) * (d_code / num_steps)
+        x_new = x + (0.5 * sigma_t * u + 0.5 * beta_t * x) * (d_code / num_steps)
         return x_new, rng_local
 
     d_code, t_idx = sample_d_and_t(rng, num_steps)

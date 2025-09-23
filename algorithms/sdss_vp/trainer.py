@@ -6,14 +6,14 @@ import distrax
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
+import jax.scipy as jsp
 import wandb
 
 from algorithms.common.diffusion_related.init_model import init_model
 from algorithms.common.eval_methods.utils import extract_last_entry
 from algorithms.sdss_vp.fb_rnd import rnd
 from algorithms.sdss_vp.distill import distillation_loss
-from algorithms.sdss_vp.vp_ou import make_ou_weight_fn
-from algorithms.sdss_vp.eval import get_multi_eval_fn
+from algorithms.sdss_vp.eval import get_multi_eval_fn, save_metrics
 from utils.print_util import print_results
 
 log = logging.getLogger(__name__)
@@ -44,6 +44,10 @@ def trainer(cfg, target, checkpointer):
     sd_wmax = alg_cfg.sd_wmax
     ema_decay = alg_cfg.ema_decay
 
+    integ_train = getattr(alg_cfg, "integrator_train", "em")
+    integ_eval = getattr(alg_cfg, "integrator_eval", "em") 
+    print(f"\n\ninteg_train {integ_train}, integ_eval {integ_eval}\n")
+
     eval_budgets = getattr(
         alg_cfg, "multi_eval_steps", [num_steps]
     )
@@ -65,6 +69,11 @@ def trainer(cfg, target, checkpointer):
             schedule,
             stop_grad=False,
             return_traj=True,
+            use_ode=False,
+            integrator_kind=integ_train,
+            schedule_type=schedule_type, 
+            beta_min=bmin, 
+            beta_max=bmax
         )
         loss = jnp.mean(run_c + term_c)
         return loss, (rng, traj)
@@ -91,7 +100,13 @@ def trainer(cfg, target, checkpointer):
 
     grad_sd = jax.jit(jax.value_and_grad(sd_loss, argnums=2, has_aux=True))
 
-    # Two RND bases: ODE for samples; SDE for weights
+    schedule_type = getattr(alg_cfg, "schedule_type", "linear")
+    bmin = bmax = None
+    if schedule_type.lower() == "linear":
+        bmin = alg_cfg.beta_min
+        bmax = alg_cfg.beta_max
+
+    # Eval with two RND bases: ODE for samples; SDE for weights
     rnd_base_ode = partial(
         rnd,
         batch_size=cfg.eval_samples,
@@ -102,6 +117,11 @@ def trainer(cfg, target, checkpointer):
         stop_grad=True,
         use_ode=True,
         return_traj=True,
+        schedule_type=schedule_type,
+        beta_min=bmin,
+        beta_max=bmax,
+        n_trapz=1025,
+        integrator_kind=integ_train, 
     )
     rnd_base_sde = partial(
         rnd,
@@ -113,23 +133,12 @@ def trainer(cfg, target, checkpointer):
         stop_grad=True,
         use_ode=False,
         return_traj=True,
-    )
-    schedule_type = getattr(alg_cfg, "schedule_type", "linear")
-    bmin = bmax = None
-    if schedule_type.lower() == "linear":
-        bmin = alg_cfg.beta_min
-        bmax = alg_cfg.beta_max
-
-    ou_weight_fn = make_ou_weight_fn(
-        prior_std=alg_cfg.init_std,
-        noise_schedule=alg_cfg.noise_schedule,
         schedule_type=schedule_type,
-        num_steps=alg_cfg.num_steps,
         beta_min=bmin,
         beta_max=bmax,
         n_trapz=1025,
+        integrator_kind=integ_eval,      
     )
-
     eval_fn, logger = get_multi_eval_fn(
         rnd_base_ode=rnd_base_ode,
         rnd_base_sde=rnd_base_sde,
@@ -137,10 +146,8 @@ def trainer(cfg, target, checkpointer):
         target_samples=target_samples,
         cfg=cfg,
         eval_budgets=eval_budgets,
-        viz_budget=viz_budget,
-        alt_weight_fn=ou_weight_fn,
-        alt_tag="ou",
-    )
+        viz_budget=viz_budget
+    )   
 
     logger["train/sc"] = []
     logger["train/grad_diff"] = []
@@ -196,26 +203,34 @@ def trainer(cfg, target, checkpointer):
 
             logger.update(eval_fn(model_state, sub))
             print_results(step, logger, cfg)
+            save_metrics(
+                logger, 
+                cfg, 
+                fmt=getattr(cfg.paths, "metrics_format", "csv"),
+                mode=getattr(cfg.paths, "metrics_mode", "append")
+            )
 
             if cfg.use_wandb:
                 wandb.log(extract_last_entry(logger))
             
             # Checkpoint  
-            if step > 0 :
-                metrics = {}
-                if logger.get('KL/elbo_mov_avg'):
-                    metrics['KL/elbo_mov_avg'] = float(logger['KL/elbo_mov_avg'][-1])
-                if logger.get('KL/neg_elbo'):
-                    metrics['KL/neg_elbo'] = float(logger['KL/neg_elbo'][-1])
-                if logger.get('discrepancies/sd_mov_avg'):
-                    metrics['discrepancies/sd_mov_avg'] = float(logger['discrepancies/sd_mov_avg'][-1])
+            # if step > 0 :
+            #     metrics = {}
+            #     if logger.get('KL/elbo_mov_avg'):
+            #         metrics['KL/elbo_mov_avg'] = float(logger['KL/elbo_mov_avg'][-1])
+            #     if logger.get('KL/neg_elbo'):
+            #         metrics['KL/neg_elbo'] = float(logger['KL/neg_elbo'][-1])
+            #     if logger.get('discrepancies/sd_mov_avg'):
+            #         metrics['discrepancies/sd_mov_avg'] = float(logger['discrepancies/sd_mov_avg'][-1])
 
-                rng, sub = jax.random.split(rng)
-                pkg = dict(
-                    model_state=jax.device_get(model_state),
-                    key_gen=sub,
-                    step=step,
-                    timer=timer,
-                )
-                future = checkpointer.save(step, pkg, metrics=metrics)
-                print(f"[Orbax] step={step} saved with metrics={metrics} (queued={future})")
+                # rng, sub = jax.random.split(rng)
+                # pkg = dict(
+                #     model_state=jax.device_get(model_state),
+                #     key_gen=sub,
+                #     step=step,
+                #     timer=timer,
+                # )
+                # future = checkpointer.save(step, pkg, metrics=metrics)
+                # print(f"[Orbax] step={step} saved with metrics={metrics} (queued={future})")
+
+

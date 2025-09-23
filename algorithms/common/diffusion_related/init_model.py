@@ -24,6 +24,7 @@ def init_model(key, dim, alg_cfg, params=None):
             )
         optimizer = optax.chain(
             optax.zero_nans(),
+            # optax.clip(alg_cfg.grad_clip) if alg_cfg.grad_clip > 0 else optax.identity(),
             optax.clip_by_global_norm(alg_cfg.grad_clip),
             optax.adamw(learning_rate=alg_cfg.step_size, weight_decay=0.1),
         )
