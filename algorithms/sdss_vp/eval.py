@@ -67,6 +67,18 @@ def get_multi_eval_fn(
         ))
         for k in eval_budgets
     }
+    rnd_fwd_ode = {
+        k: jax.jit(partial(
+            rnd_base_ode, prior_to_target=False, eval_steps=k, return_traj=True
+        ))
+        for k in eval_budgets
+    }
+    rnd_fwd_sde = {
+        k: jax.jit(partial(
+            rnd_base_sde, prior_to_target=False, eval_steps=k, return_traj=True
+        ))
+        for k in eval_budgets
+    }
 
     logger = {
         "KL/elbo": [],
@@ -75,6 +87,9 @@ def get_multi_eval_fn(
         "logZ/forward": [],
         "logZ/delta_reverse": [],
         "logZ/reverse": [],
+        "logZ/detflow": [],
+        "logZ/delta_detflow": [],
+        "ESS/detflow": [],
         "ESS/forward": [],
         "ESS/reverse": [],
         "discrepancies/mmd": [],
@@ -98,9 +113,44 @@ def get_multi_eval_fn(
         for k in eval_budgets:
             # ODE pass: samples for discrepancies/visuals
             rng, sub = jax.random.split(rng)
-            (samples_ode, _, _, _, paths_ode) = rnd_rev_ode[k](
+            (samples_ode, _rc_ode, logdet_ode, term_c_ode, paths_ode) = rnd_rev_ode[k](
                 sub, model_state, model_state.params
             )
+
+            # Deterministic-flow weights and logZ
+            log_w_det = -term_c_ode + logdet_ode
+            ln_z_det = jax.scipy.special.logsumexp(log_w_det) - jnp.log(cfg.eval_samples)
+            ess_det = compute_reverse_ess(log_w_det, cfg.eval_samples)
+            elbo_det  = jnp.mean(log_w_det)
+            _append(logger, _suffix("logZ/detflow", k), ln_z_det)
+            _append(logger, _suffix("ESS/detflow", k), ess_det)
+            if k == viz_budget:
+                _append(logger, "logZ/detflow", ln_z_det)
+                _append(logger, "ESS/detflow", ess_det)
+                if target.log_Z is not None:
+                    _append(logger, "logZ/delta_detflow", jnp.abs(ln_z_det - target.log_Z))
+
+            # Deterministic forward (EUBO) 
+            rng, sub = jax.random.split(rng)
+            (_, _rc_fwd_ode, logdet_fwd_ode, term_c_fwd_ode, _paths_fwd_ode) = rnd_fwd_ode[k](
+                sub, model_state, model_state.params
+            )
+            log_w_det_fwd = -term_c_fwd_ode + logdet_fwd_ode
+
+            # Upper bound and a second logZ estimator
+            eubo_det = jnp.mean(log_w_det_fwd) 
+            ln_z_det_fwd = -(jax.scipy.special.logsumexp(-log_w_det_fwd) - jnp.log(cfg.eval_samples))
+
+            _append(logger, _suffix("KL/elbo_detflow", k), elbo_det)  # reverse ELBO
+            _append(logger, _suffix("KL/eubo_detflow", k), eubo_det)  # forward EUBO
+            _append(logger, _suffix("logZ/forward_detflow", k), ln_z_det_fwd)
+
+            if k == viz_budget:
+                _append(logger, "KL/elbo_detflow", elbo_det)
+                _append(logger, "KL/eubo_detflow", eubo_det)
+                _append(logger, "logZ/forward_detflow", ln_z_det_fwd)
+                if target.log_Z is not None:
+                    _append(logger, "logZ/delta_forward_detflow", jnp.abs(ln_z_det_fwd - target.log_Z))
 
             # Discrepancies per budget (on ODE samples)
             for d in cfg.discrepancies:
@@ -125,25 +175,38 @@ def get_multi_eval_fn(
                 sub, model_state, model_state.params
             )
 
-            # metrics
+            # Rev metrics
             log_w_em = -(run_c_em + stoch_c + term_c)
             ln_z_em = jax.scipy.special.logsumexp(log_w_em) - jnp.log(cfg.eval_samples)
             elbo_em = jnp.mean(log_w_em)
             ess_em = compute_reverse_ess(log_w_em, cfg.eval_samples)
-
             _append(logger, _suffix("logZ/reverse", k), ln_z_em)
             _append(logger, _suffix("KL/elbo", k), elbo_em)
             _append(logger, _suffix("ESS/reverse", k), ess_em)
-
-            # Un‑suffixed for viz_budget
             if k == viz_budget:
                 _append(logger, "logZ/reverse", ln_z_em)
                 _append(logger, "KL/elbo", elbo_em)
                 _append(logger, "ESS/reverse", ess_em)
-
-            if target.log_Z is not None:
-                if k == viz_budget:
+                if target.log_Z is not None:
                     _append(logger, "logZ/delta_reverse", jnp.abs(ln_z_em - target.log_Z))
+
+            # Fwd metrics 
+            rng, sub = jax.random.split(rng)
+            (_, run_c_fwd, stoch_c_fwd, term_c_fwd, _) = rnd_fwd_sde[k](sub, model_state, model_state.params)
+            fwd_log_w = -(run_c_fwd + stoch_c_fwd + term_c_fwd)
+            eubo = jnp.mean(fwd_log_w)
+            ln_z_fwd = -(jax.scipy.special.logsumexp(-fwd_log_w) - jnp.log(cfg.eval_samples))
+            ess_fwd = jnp.exp(ln_z_fwd - (jax.scipy.special.logsumexp(fwd_log_w) - jnp.log(cfg.eval_samples)))
+            _append(logger, _suffix("KL/eubo", k), eubo)
+            _append(logger, _suffix("logZ/forward", k), ln_z_fwd)
+            _append(logger, _suffix("ESS/forward", k), ess_fwd)
+            if k == viz_budget:
+                _append(logger, "KL/eubo", eubo)
+                _append(logger, "logZ/forward", ln_z_fwd)
+                _append(logger, "ESS/forward", ess_fwd)
+                if target.log_Z is not None:
+                    _append(logger, "logZ/delta_forward", jnp.abs(ln_z_fwd - target.log_Z))
+
 
         # Visuals and extras for viz_budget
         if samples_for_plot is not None:

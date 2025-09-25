@@ -22,8 +22,12 @@ sd_warmup: 5000
 sd_wmax: 0.25
 ema_decay: 0.999
 
+trace_weight: 0.25
+n_trace_probes_train: 1
+jac_weight: 1e-4
+
 integrator_train: "em" 
-integrator_eval: "midpoint_em"
+integrator_eval: "em"
 
 init_std: ${target.dis.initial_scale}
 num_steps: 128

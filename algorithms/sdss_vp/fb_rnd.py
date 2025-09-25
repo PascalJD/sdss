@@ -69,11 +69,34 @@ def per_sample_rnd(
         return sigma_t * (
             (1.0 - tr) * target_logp(x) + tr * prior_logp(x)
         )
-
     lgv_init = partial(lgv_init, t_total=t_float)
 
+    def _beta_sigma_for_pf(sp):
+        if integrator_kind == "midpoint_em":
+            return sp.bar_beta, sp.sigma_bar
+        return sp.beta_t1, sp.sigma_t1
+
+    def _div_u_hutch(x, t_ctrl, d_norm, lgv, rng_key):
+        """
+        Hutchinson estimator of tr(du/dx) at (x, t_ctrl, d_norm, lgv).
+        One probe is typically enough for evaluation;
+        """
+        def u_fn(z):
+            return model_state.apply_fn(
+                params,
+                z,
+                t_ctrl * jnp.ones(1),
+                d_norm * jnp.ones(1),
+                lgv
+            )
+        # Rademacher via sign of normal
+        v = jnp.sign(jax.random.normal(rng_key, shape=x.shape))
+        jvp_val = jax.jvp(u_fn, (x,), (v,))[1]  # = J_u(x) @ v
+        return jnp.vdot(v, jvp_val)  # v^T J v  -> unbiased for tr(J)
+
     def sim_prior_to_target(state, t_code):
-        x, log_w_em, rng_inner = state
+        # state carry
+        x, log_w_em, logdet_ode, rng_inner = state
         if stop_grad:
             x = jax.lax.stop_gradient(x)
 
@@ -111,6 +134,17 @@ def per_sample_rnd(
         if use_ode:
             # PF ODE shortcuts for sampling
             x_new = ode_drift(integrator_kind, x, u, sp)
+
+            # accumulate log|det nabla T| via divergence integral
+            beta_pf, sigma_pf = _beta_sigma_for_pf(sp)
+            dim = x.shape[0]
+            div_lin = 0.5 * beta_pf * dim
+            rng_inner, key_h = jax.random.split(rng_inner)
+            tr_du = _div_u_hutch(x, t_ctrl, d / t_float, lgv, key_h)
+            div_ctrl = 0.5 * sigma_pf * tr_du
+
+            div_b = div_lin + div_ctrl
+            logdet_ode = logdet_ode + sp.dt * div_b
         else:
             rng_inner, sub = jax.random.split(rng_inner)
             x_new = sample_kernel(sub, fwd_m, sc)
@@ -125,10 +159,10 @@ def per_sample_rnd(
         bwd_em_lp = log_prob_kernel(x, bwd_m, sc)
         log_w_em = log_w_em + (bwd_em_lp - fwd_lp)
 
-        return (x_new, log_w_em, rng_inner), x_new
+        return (x_new, log_w_em, logdet_ode, rng_inner), x_new
 
     def sim_target_to_prior(state, t_code):
-        x, log_w_em, rng_inner = state
+        x, log_w_em, logdet_ode, rng_inner = state
         t_code = t_code.astype(jnp.float32)
 
         # per-step parameters
@@ -145,6 +179,43 @@ def per_sample_rnd(
             n_trapz=n_trapz
         )
         sc = integ_scale(integrator_kind, sp)
+
+        if use_ode:
+            # Inverse PF-ODE step: move toward t=0 with the negative drift,
+            lgv_sigma = sigma_for_lgv(integrator_kind, sp)
+            lgv = jax.lax.stop_gradient(jax.grad(lgv_init)(x, t_code, lgv_sigma))
+            t_ctrl = control_time(integrator_kind, sp)
+            u = model_state.apply_fn(
+                params, 
+                x, 
+                t_ctrl * jnp.ones(1), 
+                (d / t_float) * jnp.ones(1), 
+                lgv
+            )
+
+            # One Euler step of the inverse map
+            beta_pf, sigma_pf = _beta_sigma_for_pf(sp)
+            g = (0.5 * sigma_pf) * u + (0.5 * beta_pf) * x
+            x_new = x - sp.dt * g
+
+            # accumulate log |det dT| just like in the forward branch
+            dim = x.shape[0]
+            div_lin  = 0.5 * beta_pf * dim
+            rng_inner, key_h = jax.random.split(rng_inner)
+            tr_du    = _div_u_hutch(x, t_ctrl, d / t_float, lgv, key_h)
+            div_ctrl = 0.5 * sigma_pf * tr_du
+            logdet_ode = logdet_ode + sp.dt * (div_lin + div_ctrl)
+
+            if stop_grad:
+                x_new = jax.lax.stop_gradient(x_new)
+
+            # We keep EM kernels around for consistency bookkeeping, but they won't be used
+            bwd_m = integ_bwd_mean(integrator_kind, x, sp)
+            fwd_m = integ_fwd_mean(integrator_kind, x, u, sp)
+            fwd_lp = log_prob_kernel(x_new, fwd_m, integ_scale(integrator_kind, sp))
+            bwd_lp = log_prob_kernel(x, bwd_m, integ_scale(integrator_kind, sp))
+            log_w_em = log_w_em + (bwd_lp - fwd_lp)
+            return (x_new, log_w_em, logdet_ode, rng_inner), x_new
 
         # sample from backward kernel (denominator path)
         bwd_m = integ_bwd_mean(integrator_kind, x, sp)
@@ -172,30 +243,29 @@ def per_sample_rnd(
         fwd_lp = log_prob_kernel(x, fwd_m, sc)
         bwd_lp = log_prob_kernel(x_new, bwd_m, sc)
         log_w_em = log_w_em + (bwd_lp - fwd_lp)
-
-        return (x_new, log_w_em, rng_inner), x_new
+        return (x_new, log_w_em, logdet_ode, rng_inner), x_new
 
     rng, sub = jax.random.split(rng)
 
     if prior_to_target:
         codes_desc = step_codes[::-1]
         x0 = jnp.clip(prior_sample(seed=sub), -4 * prior_std, 4 * prior_std)
-        state0 = (x0, 0.0, rng)
-        (xT, log_ratio_em, _), xs = jax.lax.scan(
+        state0 = (x0, 0.0, 0.0, rng)
+        (xT, log_ratio_em, logdet_ode, _), xs = jax.lax.scan(
             sim_prior_to_target, state0, codes_desc
         )
         term_c = prior_logp(x0) - target_logp(xT)
     else:
         codes_asc = step_codes
         x0 = target.sample(sub, ())
-        state0 = (x0, 0.0, rng)
-        (xT, log_ratio_em, _), xs = jax.lax.scan(
+        state0 = (x0, 0.0, 0.0, rng)
+        (xT, log_ratio_em, logdet_ode, _), xs= jax.lax.scan(
             sim_target_to_prior, state0, codes_asc
         )
         term_c = prior_logp(xT) - target_logp(x0)
 
     traj = jnp.concatenate([x0[None, ...], xs], axis=0)
-    stoch_c = jnp.zeros_like(log_ratio_em)
+    stoch_c = logdet_ode if use_ode else jnp.zeros_like(log_ratio_em)
     run_c_em = -log_ratio_em
 
     return xT, run_c_em, stoch_c, term_c, traj

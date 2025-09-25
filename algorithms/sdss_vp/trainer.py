@@ -95,6 +95,9 @@ def trainer(cfg, target, checkpointer):
             target,
             schedule,
             num_steps,
+            trace_weight=alg_cfg.trace_weight,
+            n_trace_probes=alg_cfg.n_trace_probes_train,
+            jac_weight=alg_cfg.jac_weight,
         )
         return jnp.mean(mse), rng
 
